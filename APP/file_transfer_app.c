@@ -178,11 +178,12 @@ void test_read_and_print_file(const char* filename) {
 int transfer_receive_file(void) {
     memset(&g_file_info, 0, sizeof(g_file_info));
     memset(&ctx, 0, sizeof(ctx));
+    bool file_created = false;
 
     // log_printf("\r\nWaiting for file via Y-Modem...\r\n");
 
     // 1. 等待并接收 Packet 0 (文件名和大小)
-    if (!ymodem_wait_receive_header(&g_file_info, 10000)) {
+    if (!ymodem_wait_receive_header(&g_file_info, 20000)) {
         // log_printf("Timeout waiting for file header\r\n");
         return -1;
     }
@@ -196,6 +197,7 @@ int transfer_receive_file(void) {
         ymodem_send_response(YMODEM_CAN); // 告诉上位机取消
         return -1;
     }
+    file_created = true;
     // log_printf("Starting Y-Modem transfer...\r\n");
 
     
@@ -210,6 +212,12 @@ int transfer_receive_file(void) {
     lfs_ymodem_close(NULL);
 
     if(result != YMODEM_OK) {
+        if (file_created && g_file_info.filename[0] != '\0') {
+            lfs_t *lfs = lfs_port_get();
+            if (lfs != NULL) {
+                lfs_remove(lfs, g_file_info.filename);
+            }
+        }
         // log_printf("Transfer Failed! Code: %d\r\n", result);
         return -2;
     }

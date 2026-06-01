@@ -11,15 +11,55 @@ static void parse_header_packet(uint8_t *buf, ymodem_file_info_t *info) {
     info->file_size = (uint32_t)atoi(p);
 }
 
+static int wait_final_empty_header(uint32_t timeout) {
+    uint8_t c, buf[1024], seq[2], crc_bytes[2];
+    uint32_t start = HAL_GetTick();
+
+    while ((HAL_GetTick() - start) < timeout) {
+        uint32_t elapsed = HAL_GetTick() - start;
+        uint32_t remaining = (elapsed < timeout) ? (timeout - elapsed) : 0;
+        uint32_t step = (remaining > 1000U) ? 1000U : remaining;
+
+        if (step == 0U) {
+            break;
+        }
+
+        if (ymodem_port_read(&c, 1, step) <= 0) {
+            continue;
+        }
+
+        if (c == YMODEM_SOH) {
+            ymodem_file_info_t end_info = {0};
+
+            if (ymodem_port_read(seq, 2, 500) < 2) continue;
+            if (ymodem_port_read(buf, 128, 500) < 128) continue;
+            if (ymodem_port_read(crc_bytes, 2, 500) < 2) continue;
+
+            if (seq[0] == 0x00 && (uint8_t)(seq[0] + seq[1]) == 0xFF) {
+                parse_header_packet(buf, &end_info);
+                if (end_info.filename[0] == '\0') {
+                    ymodem_send_response(YMODEM_ACK);
+                    return YMODEM_OK;
+                }
+            }
+        } else if (c == YMODEM_CAN || c == 0x03) {
+            return YMODEM_ERROR;
+        }
+    }
+
+    return YMODEM_TIMEOUT;
+}
+
 
 
 int ymodem_wait_receive_header(ymodem_file_info_t *info, uint32_t timeout) {
     uint8_t c, buf[1024], seq[2], crc_bytes[2];
     uint32_t retry = 0;
-    const uint32_t max_retries = 20; 
+    const uint32_t max_retries = (timeout + 999U) / 1000U;
+    const uint32_t loops = (max_retries == 0U) ? 1U : max_retries;
 
 
-    while (retry < max_retries) {
+    while (retry < loops) {
         // 1. 发送 'C' 启动传输
         ymodem_send_response(YMODEM_C);
 
@@ -82,6 +122,11 @@ int ymodem_receive_file_with_callback(ymodem_file_info_t *info, ymodem_packet_cb
         if (c == YMODEM_EOT) {
             // 收到结束标志
             ymodem_send_response(YMODEM_ACK);
+            ymodem_send_response(YMODEM_C);
+
+            if (wait_final_empty_header(3000) == YMODEM_OK) {
+                return YMODEM_OK;
+            }
             return YMODEM_OK;
         }
 

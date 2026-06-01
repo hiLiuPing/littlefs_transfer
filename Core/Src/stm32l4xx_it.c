@@ -26,10 +26,7 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN TD */
-#include "FreeRTOS.h"    // 解决 BaseType_t, pdFALSE 等定义问题
-#include "task.h"        // 解决 TaskHandle_t, vTaskNotifyGiveFromISR 等问题
 #include "uart_dma.h"    // 解决 uart_dma_rx_check, UART_DMA_RX_SIZE 等问题
-extern TaskHandle_t Ymodem_Task_Handle; // 声明外部任务句柄
 extern uart_dma_t uart1_admin; // 唯一实体的定义
 /* USER CODE END TD */
 
@@ -193,12 +190,6 @@ void USART1_IRQHandler(void)
 
         uart_dma_rx_check(&uart1_admin);   // 搬运DMA数据
     }
-//  HAL_GPIO_TogglePin(LED_B_GPIO_Port, LED_B_Pin); // 触发LED闪烁，观察中断响应
-   BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-        if(Ymodem_Task_Handle != NULL) {
-            vTaskNotifyGiveFromISR(Ymodem_Task_Handle, &xHigherPriorityTaskWoken);
-        }
-        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
   /* USER CODE END USART1_IRQn 0 */
   HAL_UART_IRQHandler(&huart1);
   /* USER CODE BEGIN USART1_IRQn 1 */

@@ -8,6 +8,7 @@
 #include "spi_flash.h"
 #include "uart_dma.h"
 #include <string.h>
+#include <stdlib.h>
 
 /* ===================== 内部配置宏 ===================== */
 #define CLI_BUF_SIZE            128
@@ -31,6 +32,18 @@ uint8_t u1_rb_buf[4096];
 /* CLI 动态输入缓冲区与状态变量 */
 char cli_buf[CLI_BUF_SIZE];
 uint16_t cli_idx = 0;
+static bool cli_last_was_cr = false;
+
+#define CLI_DELETE_LIST_MAX 64
+static char cli_delete_files[CLI_DELETE_LIST_MAX][LFS_NAME_MAX + 1];
+static uint8_t cli_delete_file_count = 0;
+
+typedef enum {
+    CLI_MODE_COMMAND = 0,
+    CLI_MODE_DELETE_SELECT,
+} cli_mode_t;
+
+static cli_mode_t cli_mode = CLI_MODE_COMMAND;
 
 /* ===================== FreeRTOS 任务句柄 ===================== */
 TaskHandle_t Ymodem_Task_Handle = NULL;
@@ -39,7 +52,14 @@ TaskHandle_t cli_task_handle = NULL;
 /* ===================== 前向声明 ===================== */
 void vYmodem_Task(void *pvParameters);
 void cli_task(void *arg);
-void cli_execute(char *cmd);
+bool cli_execute(char *cmd);
+static void cli_reset_line(void);
+static void cli_prompt(void);
+static void cli_handle_byte(uint8_t ch);
+static char *cli_trim(char *s);
+static void cli_enter_delete_mode(void);
+static int cli_collect_deletable_files(void);
+static bool cli_handle_delete_selection(char *cmd);
 
 /* ===================== 统一的初始化入口 ===================== */
 void myTask()
@@ -52,86 +72,6 @@ void myTask()
     if (p_lfs == NULL) {
         log_printf("[System] Error: LittleFS instance pointer is NULL!\r\n");
     }
-/* ---------------- 新增：启动时自动扫描并打印存储的文件内容 ---------------- */
-    log_printf("\r\n--- [Storage Scan Start] ---\r\n");
-    
-    struct lfs_info info;
-    lfs_dir_t dir;
-    
-    // 打开根目录
-    if (lfs_dir_open(p_lfs, &dir, "/") == 0)
-    {
-        int file_count = 0;
-        
-        // 循环读取目录下的每一个条目
-        while (lfs_dir_read(p_lfs, &dir, &info) > 0)
-        {
-            // 过滤掉当前目录 "." 和 上级目录 ".."
-            if (strcmp(info.name, ".") == 0 || strcmp(info.name, "..") == 0) {
-                continue;
-            }
-            
-            file_count++;
-            
-            // 判断是文件还是目录
-            if (info.type == LFS_TYPE_REG) 
-            {
-                log_printf("📄 File: %-20s | Size: %6d bytes\r\n", info.name, (int)info.size);
-                
-                // 尝试打开该文件并读取前一段内容
-                lfs_file_t file_preview;
-                if (lfs_file_open(p_lfs, &file_preview, info.name, LFS_O_RDONLY) == 0)
-                {
-                    char preview_buf[64]; // 在栈上开辟 64 字节缓冲区，安全稳妥
-                    
-                    // 读取前段内容（最多64字节）
-                    int read_bytes = lfs_file_read(p_lfs, &file_preview, preview_buf, sizeof(preview_buf));
-                    if (read_bytes > 0)
-                    {
-                        // 使用 %.*s 语法指定只打印读取到的 read_bytes 长度，绝对不会越界或打印出乱码
-                        log_printf("   └── Preview: %.*s", read_bytes, preview_buf);
-                        
-                        // 如果文件没有以换行结尾，补一个换行让日志整洁
-                        if (preview_buf[read_bytes - 1] != '\n') {
-                            log_printf("\r\n");
-                        }
-                    }
-                    else if (read_bytes == 0)
-                    {
-                        log_printf("   └── Preview: [Empty File]\r\n");
-                    }
-                    else
-                    {
-                        log_printf("   └── Preview: [Read Error: %d]\r\n", read_bytes);
-                    }
-                    
-                    // 读取完一定要记得关闭文件
-                    lfs_file_close(p_lfs, &file_preview);
-                }
-                else
-                {
-                    log_printf("   └── [Error] Could not open file for preview.\r\n");
-                }
-            }
-            else if (info.type == LFS_TYPE_DIR)
-            {
-                log_printf("📁 Folder: %-18s |\r\n", info.name);
-            }
-        }
-        
-        if (file_count == 0) {
-            log_printf("[Storage] LittleFS is empty. No files found.\r\n");
-        }
-        
-        // 关闭目录句柄
-        lfs_dir_close(p_lfs, &dir);
-    }
-    else
-    {
-        log_printf("[Storage] Error: Failed to open root directory '/'!\r\n");
-    }
-    log_printf("--- [Storage Scan End] ---\r\n\r\n");
-    /* ----------------------------------------------------------------- */
     /* 3. 初始化串口 1 DMA 实例（用于接收一切数据） */
     uart_dma_init(&uart1_admin, &huart1, u1_dma_buf, sizeof(u1_dma_buf), u1_rb_buf, sizeof(u1_rb_buf));
 
@@ -153,49 +93,23 @@ void myTask()
                 NULL, 
                 2, 
                 &cli_task_handle);
+
+    log_printf("[CLI] Ready. Type 'help' for commands.\r\n");
 }
 
 /* ===================== 改进后的 CLI 任务 ===================== */
 void cli_task(void *arg)
 {
     cli_task_handle = xTaskGetCurrentTaskHandle();
-    log_printf("[CLI] UART1 CLI Ready. Type 'help' for commands.\r\n");
-    
-    char ch;
+    cli_reset_line();
+    cli_prompt();
+
     for (;;)
     {
-        /* 从统一的 uart1 环形缓冲区中逐字节读取 */
-        if (lwrb_read(&uart1_admin.uart_rb, &ch, 1) > 0)
-        {
-            if (ch == '\r' || ch == '\n')
-            {
-                // 修复误触核心：只要遇到换行，不管前面有没有数据，都必须对缓冲区切断处理
-                cli_buf[cli_idx] = 0; 
-                
-                if (cli_idx > 0)
-                {
-                    log_printf("[CLI] CMD: %s\r\n", cli_buf);
-                    cli_execute(cli_buf);
-                    cli_idx = 0; // 执行完立刻清空
-                }
-            }
-            else
-            {
-                // 正常字符压入缓冲区
-                if (cli_idx < CLI_BUF_SIZE - 1)
-                {
-                    cli_buf[cli_idx++] = ch;
-                }
-                else
-                {
-                    // 缓冲区爆了，强制复位，防止内存越界破坏系统
-                    cli_idx = 0;
-                    memset(cli_buf, 0, sizeof(cli_buf));
-                }
-            }
-        }
-        else
-        {
+        uint8_t ch;
+        if (lwrb_read(&uart1_admin.uart_rb, &ch, 1) > 0) {
+            cli_handle_byte(ch);
+        } else {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
@@ -208,7 +122,7 @@ void vYmodem_Task(void *pvParameters)
 
     for (;;)
     {
-        /* 1. 阻塞等待 CLI 发送 download 指令来唤醒 */
+        /* 1. 阻塞等待 CLI 发送 down 指令来唤醒 */
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
         /* 2. 激活全局传输锁：通知 log_printf 此时闭嘴 */
@@ -244,15 +158,27 @@ void vYmodem_Task(void *pvParameters)
             log_printf("[Transfer] Failed or Timeout. Error: %d\r\n", result);
         }
         log_printf("[System] Back to CLI Mode.\r\n");  
+        cli_prompt();
     }
 }
 
 /* ===================== 命令执行器 ===================== */
-void cli_execute(char *cmd)
+bool cli_execute(char *cmd)
 {
+    cmd = cli_trim(cmd);
+    if (*cmd == '\0') {
+        return true;
+    }
+
+    log_printf("[CLI] CMD: %s\r\n", cmd);
+
+    if (cli_mode == CLI_MODE_DELETE_SELECT) {
+        return cli_handle_delete_selection(cmd);
+    }
+
     if (p_lfs == NULL) {
         log_printf("[CLI] Error: LittleFS not initialized properly.\r\n");
-        return;
+        return true;
     }
 
     /* ===== 精准匹配：ls ===== */
@@ -272,22 +198,34 @@ void cli_execute(char *cmd)
         {
             log_printf("[CLI] Failed to open root directory.\r\n");
         }
-        return;
+        return true;
     }
 
     /* ===== 精准匹配：rm ===== */
     if (strncmp(cmd, "rm ", 3) == 0)
     {
-        char *file = cmd + 3;
+        char *file = cli_trim(cmd + 3);
+        if (*file == '\0') {
+            log_printf("[CLI] usage: rm <file>\r\n");
+            return true;
+        }
         int ret = lfs_remove(p_lfs, file);
-        log_printf("[CLI] rm %s => %d\r\n", file, ret);
-        return;
+        if (ret == 0) {
+            log_printf("[CLI] delete %s success.\r\n", file);
+        } else {
+            log_printf("[CLI] delete %s failed, ret=%d\r\n", file, ret);
+        }
+        return true;
     }
 
     /* ===== 精准匹配：cat ===== */
     if (strncmp(cmd, "cat ", 4) == 0)
     {
-        char *file = cmd + 4;
+        char *file = cli_trim(cmd + 4);
+        if (*file == '\0') {
+            log_printf("[CLI] usage: cat <file>\r\n");
+            return true;
+        }
         lfs_file_t f;
         char buf[64];
         if (lfs_file_open(p_lfs, &f, file, LFS_O_RDONLY) == 0)
@@ -304,18 +242,27 @@ void cli_execute(char *cmd)
         {
             log_printf("[CLI] Failed to open file: %s\r\n", file);
         }
-        return;
+        return true;
     }
 
-    /* ===== 严格匹配：download ===== */
-    if (strcmp(cmd, "download") == 0)
+    /* ===== 严格匹配：down ===== */
+    if (strcmp(cmd, "down") == 0 || strcmp(cmd, "download") == 0)
     {
         if (Ymodem_Task_Handle != NULL)
         {
-            log_printf("[CLI] Switching to YModem mode... Please start YModem send within 10s.\r\n");
+            log_printf("[CLI] Switching to YModem mode... Please start YModem send within 20s.\r\n");
             xTaskNotifyGive(Ymodem_Task_Handle);
+            return false;
         }
-        return;
+        log_printf("[CLI] YModem task is not ready.\r\n");
+        return true;
+    }
+
+    /* ===== delete: 进入交互式删除模式 ===== */
+    if (strcmp(cmd, "delete") == 0)
+    {
+        cli_enter_delete_mode();
+        return true;
     }
 
     /* ===== 精准匹配：help ===== */
@@ -323,12 +270,187 @@ void cli_execute(char *cmd)
     {
         log_printf("Commands:\r\n");
         log_printf("  ls             - List files\r\n");
-        log_printf("  rm <file>      - Delete file\r\n");
+        log_printf("  rm <file>      - Delete one file by name\r\n");
+        log_printf("  delete         - Interactive delete by index\r\n");
         log_printf("  cat <file>     - View file content\r\n");
-        log_printf("  download       - Start YModem file receive\r\n");
-        return;
+        log_printf("  down           - Start YModem file receive\r\n");
+        return true;
     }
 
     /* 安全防线：任何不认识的脏数据、乱码、空敲回车全部拦截在此处 */
     log_printf("[CLI] unknown cmd: '%s'\r\n", cmd);
+    return true;
+}
+
+static void cli_reset_line(void)
+{
+    memset(cli_buf, 0, sizeof(cli_buf));
+    cli_idx = 0;
+    cli_last_was_cr = false;
+}
+
+static void cli_prompt(void)
+{
+    if (cli_mode == CLI_MODE_DELETE_SELECT) {
+        log_printf("delete> ");
+    } else {
+        log_printf("> ");
+    }
+}
+
+static void cli_handle_byte(uint8_t ch)
+{
+    if (ch == '\r' || ch == '\n') {
+        if (ch == '\n' && cli_last_was_cr) {
+            cli_last_was_cr = false;
+            return;
+        }
+
+        cli_last_was_cr = (ch == '\r');
+        log_printf("\r\n");
+
+        bool show_prompt = true;
+        if (cli_idx > 0) {
+            cli_buf[cli_idx] = '\0';
+            show_prompt = cli_execute(cli_buf);
+            cli_reset_line();
+        }
+
+        if (show_prompt) {
+            cli_prompt();
+        }
+        return;
+    }
+
+    cli_last_was_cr = false;
+
+    if (ch == 0x08 || ch == 0x7F) {
+        if (cli_idx > 0) {
+            cli_idx--;
+            cli_buf[cli_idx] = '\0';
+        }
+        return;
+    }
+
+    if (ch >= 0x20 && ch <= 0x7E) {
+        if (cli_idx < CLI_BUF_SIZE - 1) {
+            cli_buf[cli_idx++] = (char)ch;
+        }
+    }
+}
+
+static char *cli_trim(char *s)
+{
+    char *start = s;
+    while (*start == ' ' || *start == '\t') {
+        start++;
+    }
+
+    char *end = start + strlen(start);
+    while (end > start && (end[-1] == ' ' || end[-1] == '\t')) {
+        end--;
+    }
+    *end = '\0';
+    return start;
+}
+
+static int cli_collect_deletable_files(void)
+{
+    cli_delete_file_count = 0;
+
+    if (p_lfs == NULL) {
+        return -1;
+    }
+
+    struct lfs_info info;
+    lfs_dir_t dir;
+
+    if (lfs_dir_open(p_lfs, &dir, "/") != 0) {
+        return -1;
+    }
+
+    while (lfs_dir_read(p_lfs, &dir, &info) > 0)
+    {
+        if (strcmp(info.name, ".") == 0 || strcmp(info.name, "..") == 0) {
+            continue;
+        }
+
+        if (info.type != LFS_TYPE_REG) {
+            continue;
+        }
+
+        if (cli_delete_file_count >= CLI_DELETE_LIST_MAX) {
+            log_printf("[CLI] delete list truncated at %u files.\r\n", (unsigned)CLI_DELETE_LIST_MAX);
+            break;
+        }
+
+        strncpy(cli_delete_files[cli_delete_file_count], info.name, LFS_NAME_MAX);
+        cli_delete_files[cli_delete_file_count][LFS_NAME_MAX] = '\0';
+        log_printf("  [%u] %-20s %6d bytes\r\n",
+                   (unsigned)(cli_delete_file_count + 1),
+                   info.name,
+                   (int)info.size);
+        cli_delete_file_count++;
+    }
+
+    lfs_dir_close(p_lfs, &dir);
+    return (int)cli_delete_file_count;
+}
+
+static void cli_enter_delete_mode(void)
+{
+    int count = cli_collect_deletable_files();
+    if (count < 0) {
+        log_printf("[CLI] Failed to scan files.\r\n");
+        cli_mode = CLI_MODE_COMMAND;
+        return;
+    }
+
+    if (count == 0) {
+        log_printf("[CLI] No files found.\r\n");
+        cli_mode = CLI_MODE_COMMAND;
+        return;
+    }
+
+    cli_mode = CLI_MODE_DELETE_SELECT;
+    log_printf("[CLI] Input file index to delete, or 'q' to cancel.\r\n");
+}
+
+static bool cli_handle_delete_selection(char *cmd)
+{
+    cmd = cli_trim(cmd);
+    if (strcmp(cmd, "q") == 0 || strcmp(cmd, "quit") == 0 || strcmp(cmd, "cancel") == 0) {
+        cli_mode = CLI_MODE_COMMAND;
+        log_printf("[CLI] delete canceled.\r\n");
+        return true;
+    }
+
+    char *end = NULL;
+    long idx = strtol(cmd, &end, 10);
+    if (end == cmd) {
+        log_printf("[CLI] please input a valid index.\r\n");
+        return true;
+    }
+
+    end = cli_trim(end);
+    if (*end != '\0') {
+        log_printf("[CLI] please input a valid index.\r\n");
+        return true;
+    }
+
+    if (idx < 1 || idx > cli_delete_file_count) {
+        log_printf("[CLI] index out of range (1-%u).\r\n", (unsigned)cli_delete_file_count);
+        return true;
+    }
+
+    const char *file = cli_delete_files[idx - 1];
+    int ret = lfs_remove(p_lfs, file);
+    if (ret == 0) {
+        log_printf("[CLI] delete %s success.\r\n", file);
+    } else {
+        log_printf("[CLI] delete %s failed, ret=%d\r\n", file, ret);
+    }
+
+    cli_mode = CLI_MODE_COMMAND;
+    return true;
 }
