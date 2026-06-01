@@ -57,6 +57,7 @@ static void cli_reset_line(void);
 static void cli_prompt(void);
 static void cli_handle_byte(uint8_t ch);
 static char *cli_trim(char *s);
+static void cli_print_size_kb(uint32_t size_bytes);
 static void cli_enter_delete_mode(void);
 static int cli_collect_deletable_files(void);
 static bool cli_handle_delete_selection(char *cmd);
@@ -190,7 +191,9 @@ bool cli_execute(char *cmd)
         {
             while (lfs_dir_read(p_lfs, &dir, &info) > 0)
             {
-                log_printf("%-20s %6d bytes\r\n", info.name, (int)info.size);
+                log_printf("%-20s ", info.name);
+                cli_print_size_kb((uint32_t)info.size);
+                log_printf("\r\n");
             }
             lfs_dir_close(p_lfs, &dir);
         }
@@ -354,6 +357,13 @@ static char *cli_trim(char *s)
     return start;
 }
 
+static void cli_print_size_kb(uint32_t size_bytes)
+{
+    uint32_t kb = size_bytes / 1024U;
+    uint32_t tenth = (size_bytes % 1024U) * 10U / 1024U;
+    log_printf("%lu.%lu KB", (unsigned long)kb, (unsigned long)tenth);
+}
+
 static int cli_collect_deletable_files(void)
 {
     cli_delete_file_count = 0;
@@ -386,10 +396,11 @@ static int cli_collect_deletable_files(void)
 
         strncpy(cli_delete_files[cli_delete_file_count], info.name, LFS_NAME_MAX);
         cli_delete_files[cli_delete_file_count][LFS_NAME_MAX] = '\0';
-        log_printf("  [%u] %-20s %6d bytes\r\n",
+        log_printf("  [%u] %-20s ",
                    (unsigned)(cli_delete_file_count + 1),
-                   info.name,
-                   (int)info.size);
+                   info.name);
+        cli_print_size_kb((uint32_t)info.size);
+        log_printf("\r\n");
         cli_delete_file_count++;
     }
 
