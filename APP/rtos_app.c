@@ -41,9 +41,19 @@ static uint8_t cli_delete_file_count = 0;
 typedef enum {
     CLI_MODE_COMMAND = 0,
     CLI_MODE_DELETE_SELECT,
+    CLI_MODE_DELETE_CONFIRM,
 } cli_mode_t;
 
 static cli_mode_t cli_mode = CLI_MODE_COMMAND;
+
+typedef enum {
+    DELETE_CONFIRM_NONE = 0,
+    DELETE_CONFIRM_ONE,
+    DELETE_CONFIRM_ALL,
+} delete_confirm_action_t;
+
+static delete_confirm_action_t cli_delete_confirm_action = DELETE_CONFIRM_NONE;
+static char cli_delete_target[LFS_NAME_MAX + 1];
 
 /* ===================== FreeRTOS 任务句柄 ===================== */
 TaskHandle_t Ymodem_Task_Handle = NULL;
@@ -58,6 +68,13 @@ static void cli_prompt(void);
 static void cli_handle_byte(uint8_t ch);
 static char *cli_trim(char *s);
 static void cli_print_size_kb(uint32_t size_bytes);
+static void cli_print_fs_kb(uint32_t size_bytes);
+static void cli_print_type(uint8_t type);
+static void cli_print_delete_prompt(void);
+static void cli_begin_delete_one(const char *path);
+static void cli_begin_delete_all(void);
+static bool cli_handle_delete_confirm(char *cmd);
+static void cli_clear_delete_state(void);
 static void cli_enter_delete_mode(void);
 static int cli_collect_deletable_files(void);
 static bool cli_handle_delete_selection(char *cmd);
@@ -177,6 +194,10 @@ bool cli_execute(char *cmd)
         return cli_handle_delete_selection(cmd);
     }
 
+    if (cli_mode == CLI_MODE_DELETE_CONFIRM) {
+        return cli_handle_delete_confirm(cmd);
+    }
+
     if (p_lfs == NULL) {
         log_printf("[CLI] Error: LittleFS not initialized properly.\r\n");
         return true;
@@ -212,12 +233,7 @@ bool cli_execute(char *cmd)
             log_printf("[CLI] usage: rm <file>\r\n");
             return true;
         }
-        int ret = lfs_remove(p_lfs, file);
-        if (ret == 0) {
-            log_printf("[CLI] delete %s success.\r\n", file);
-        } else {
-            log_printf("[CLI] delete %s failed, ret=%d\r\n", file, ret);
-        }
+        cli_begin_delete_one(file);
         return true;
     }
 
@@ -248,6 +264,58 @@ bool cli_execute(char *cmd)
         return true;
     }
 
+    /* ===== 精准匹配：stat ===== */
+    if (strncmp(cmd, "stat ", 5) == 0)
+    {
+        char *path = cli_trim(cmd + 5);
+        if (*path == '\0') {
+            log_printf("[CLI] usage: stat <file>\r\n");
+            return true;
+        }
+
+        struct lfs_info info;
+        int ret = lfs_stat(p_lfs, path, &info);
+        if (ret != 0) {
+            log_printf("[CLI] stat failed: %s, ret=%d\r\n", path, ret);
+            return true;
+        }
+
+        log_printf("[CLI] name: %s\r\n", info.name);
+        log_printf("[CLI] type: ");
+        cli_print_type(info.type);
+        log_printf("\r\n");
+        log_printf("[CLI] size: ");
+        cli_print_size_kb((uint32_t)info.size);
+        log_printf("\r\n");
+        return true;
+    }
+
+    /* ===== 精准匹配：free ===== */
+    if (strcmp(cmd, "free") == 0)
+    {
+        lfs_ssize_t used_blocks = lfs_fs_size(p_lfs);
+        if (used_blocks < 0) {
+            log_printf("[CLI] free failed, ret=%ld\r\n", (long)used_blocks);
+            return true;
+        }
+
+        uint32_t total_blocks = (uint32_t)LFS_BLOCK_COUNT;
+        uint32_t used = (uint32_t)used_blocks;
+        uint32_t free_blocks = (used < total_blocks) ? (total_blocks - used) : 0U;
+
+        log_printf("[CLI] filesystem:\r\n");
+        log_printf("  total: ");
+        cli_print_fs_kb(total_blocks * LFS_BLOCK_SIZE);
+        log_printf("\r\n");
+        log_printf("  used : ");
+        cli_print_fs_kb(used * LFS_BLOCK_SIZE);
+        log_printf("\r\n");
+        log_printf("  free : ");
+        cli_print_fs_kb(free_blocks * LFS_BLOCK_SIZE);
+        log_printf("\r\n");
+        return true;
+    }
+
     /* ===== 严格匹配：down ===== */
     if (strcmp(cmd, "down") == 0 || strcmp(cmd, "download") == 0)
     {
@@ -268,14 +336,24 @@ bool cli_execute(char *cmd)
         return true;
     }
 
+    /* ===== deleteall: 删除所有文件 ===== */
+    if (strcmp(cmd, "deleteall") == 0)
+    {
+        cli_begin_delete_all();
+        return true;
+    }
+
     /* ===== 精准匹配：help ===== */
     if (strcmp(cmd, "help") == 0)
     {
         log_printf("Commands:\r\n");
         log_printf("  ls             - List files\r\n");
-        log_printf("  rm <file>      - Delete one file by name\r\n");
+        log_printf("  rm <file>      - Delete one file with confirm\r\n");
         log_printf("  delete         - Interactive delete by index\r\n");
+        log_printf("  deleteall      - Delete all files with confirm\r\n");
         log_printf("  cat <file>     - View file content\r\n");
+        log_printf("  stat <file>    - Show file info\r\n");
+        log_printf("  free           - Show filesystem usage\r\n");
         log_printf("  down           - Start YModem file receive\r\n");
         return true;
     }
@@ -296,6 +374,8 @@ static void cli_prompt(void)
 {
     if (cli_mode == CLI_MODE_DELETE_SELECT) {
         log_printf("delete> ");
+    } else if (cli_mode == CLI_MODE_DELETE_CONFIRM) {
+        log_printf("confirm> ");
     } else {
         log_printf("> ");
     }
@@ -362,6 +442,112 @@ static void cli_print_size_kb(uint32_t size_bytes)
     uint32_t kb = size_bytes / 1024U;
     uint32_t tenth = (size_bytes % 1024U) * 10U / 1024U;
     log_printf("%lu.%lu KB", (unsigned long)kb, (unsigned long)tenth);
+}
+
+static void cli_print_fs_kb(uint32_t size_bytes)
+{
+    cli_print_size_kb(size_bytes);
+}
+
+static void cli_print_type(uint8_t type)
+{
+    if (type == LFS_TYPE_REG) {
+        log_printf("file");
+    } else if (type == LFS_TYPE_DIR) {
+        log_printf("dir");
+    } else {
+        log_printf("unknown(0x%02X)", type);
+    }
+}
+
+static void cli_clear_delete_state(void)
+{
+    cli_delete_confirm_action = DELETE_CONFIRM_NONE;
+    cli_delete_target[0] = '\0';
+    cli_delete_file_count = 0;
+    cli_mode = CLI_MODE_COMMAND;
+}
+
+static void cli_print_delete_prompt(void)
+{
+    if (cli_delete_confirm_action == DELETE_CONFIRM_ONE) {
+        log_printf("[CLI] Delete %s? (yes/no)\r\n", cli_delete_target);
+    } else if (cli_delete_confirm_action == DELETE_CONFIRM_ALL) {
+        log_printf("[CLI] Delete all files? (yes/no)\r\n");
+    }
+}
+
+static void cli_begin_delete_one(const char *path)
+{
+    strncpy(cli_delete_target, path, LFS_NAME_MAX);
+    cli_delete_target[LFS_NAME_MAX] = '\0';
+    cli_delete_confirm_action = DELETE_CONFIRM_ONE;
+    cli_mode = CLI_MODE_DELETE_CONFIRM;
+    cli_print_delete_prompt();
+}
+
+static void cli_begin_delete_all(void)
+{
+    int count = cli_collect_deletable_files();
+    if (count < 0) {
+        log_printf("[CLI] Failed to scan files.\r\n");
+        cli_clear_delete_state();
+        return;
+    }
+
+    if (count == 0) {
+        log_printf("[CLI] No files found.\r\n");
+        cli_clear_delete_state();
+        return;
+    }
+
+    cli_delete_confirm_action = DELETE_CONFIRM_ALL;
+    cli_mode = CLI_MODE_DELETE_CONFIRM;
+    cli_print_delete_prompt();
+}
+
+static bool cli_handle_delete_confirm(char *cmd)
+{
+    cmd = cli_trim(cmd);
+
+    if (strcmp(cmd, "yes") == 0 || strcmp(cmd, "y") == 0) {
+        if (cli_delete_confirm_action == DELETE_CONFIRM_ONE) {
+            int ret = lfs_remove(p_lfs, cli_delete_target);
+            if (ret == 0) {
+                log_printf("[CLI] delete %s success.\r\n", cli_delete_target);
+            } else {
+                log_printf("[CLI] delete %s failed, ret=%d\r\n", cli_delete_target, ret);
+            }
+        } else if (cli_delete_confirm_action == DELETE_CONFIRM_ALL) {
+            uint8_t deleted = 0;
+            uint8_t failed = 0;
+
+            for (uint8_t i = 0; i < cli_delete_file_count; i++) {
+                int ret = lfs_remove(p_lfs, cli_delete_files[i]);
+                if (ret == 0) {
+                    deleted++;
+                } else {
+                    failed++;
+                }
+            }
+
+            log_printf("[CLI] delete all done: %u success, %u failed.\r\n",
+                       (unsigned)deleted,
+                       (unsigned)failed);
+        }
+
+        cli_clear_delete_state();
+        return true;
+    }
+
+    if (strcmp(cmd, "no") == 0 || strcmp(cmd, "n") == 0 || strcmp(cmd, "cancel") == 0) {
+        log_printf("[CLI] delete canceled.\r\n");
+        cli_clear_delete_state();
+        return true;
+    }
+
+    log_printf("[CLI] please type yes or no.\r\n");
+    return true;
 }
 
 static int cli_collect_deletable_files(void)
@@ -431,7 +617,7 @@ static bool cli_handle_delete_selection(char *cmd)
 {
     cmd = cli_trim(cmd);
     if (strcmp(cmd, "q") == 0 || strcmp(cmd, "quit") == 0 || strcmp(cmd, "cancel") == 0) {
-        cli_mode = CLI_MODE_COMMAND;
+        cli_clear_delete_state();
         log_printf("[CLI] delete canceled.\r\n");
         return true;
     }
@@ -454,14 +640,6 @@ static bool cli_handle_delete_selection(char *cmd)
         return true;
     }
 
-    const char *file = cli_delete_files[idx - 1];
-    int ret = lfs_remove(p_lfs, file);
-    if (ret == 0) {
-        log_printf("[CLI] delete %s success.\r\n", file);
-    } else {
-        log_printf("[CLI] delete %s failed, ret=%d\r\n", file, ret);
-    }
-
-    cli_mode = CLI_MODE_COMMAND;
+    cli_begin_delete_one(cli_delete_files[idx - 1]);
     return true;
 }
