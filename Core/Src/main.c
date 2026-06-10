@@ -18,7 +18,6 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "cmsis_os.h"
 #include "dma.h"
 #include "spi.h"
 #include "tim.h"
@@ -28,6 +27,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "log.h"
+#include "rtos_app.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -53,7 +53,6 @@
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
-void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -94,23 +93,14 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_USART1_UART_Init();
-  MX_TIM6_Init();
   MX_SPI2_Init();
   /* USER CODE BEGIN 2 */
 log_init(&huart1); // 假设 log 用的是 huart1，根据实际修改
     log_printf("\r\n================================\r\n");
     log_printf("   LittleFS YModem File Transfer\r\n");
     log_printf("================================\r\n");
+    app_init();
   /* USER CODE END 2 */
-
-  /* Init scheduler */
-  osKernelInitialize();  /* Call init function for freertos objects (in cmsis_os2.c) */
-  MX_FREERTOS_Init();
-
-  /* Start scheduler */
-  osKernelStart();
-
-  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -119,6 +109,7 @@ log_init(&huart1); // 假设 log 用的是 huart1，根据实际修改
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    app_poll();
   }
   /* USER CODE END 3 */
 }

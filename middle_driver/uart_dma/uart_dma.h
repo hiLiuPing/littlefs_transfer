@@ -22,6 +22,7 @@ typedef struct {
 /* 函数接口改为传入指针 */
 void uart_dma_init(uart_dma_t* ctrl, UART_HandleTypeDef* huart, uint8_t* dma_buf, uint32_t dma_size, uint8_t* rb_buf, uint32_t rb_size);
 void uart_dma_rx_check(uart_dma_t* ctrl);
+void uart_dma_clear(uart_dma_t* ctrl);
 int uart_dma_read(uart_dma_t* ctrl, uint8_t *data, uint32_t len, uint32_t timeout);
 int uart_dma_write(uart_dma_t* ctrl, const uint8_t *data, uint32_t len, uint32_t timeout);
 

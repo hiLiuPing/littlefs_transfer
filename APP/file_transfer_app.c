@@ -31,7 +31,6 @@ void transfer_init(void)
    
        if (spi_flash_init(&flash_32mb, &hspi2, SPI2_CS_GPIO_Port, SPI2_CS_Pin) != 0) {
         log_printf("Flash Hardware Init Failed!\r\n");
-        // vTaskDelete(NULL);
         return;
     }
     lfs_port_init(&flash_32mb);

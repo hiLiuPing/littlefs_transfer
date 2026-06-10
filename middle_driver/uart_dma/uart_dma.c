@@ -42,6 +42,16 @@ void uart_dma_rx_check(uart_dma_t* ctrl)
     }
 }
 
+void uart_dma_clear(uart_dma_t* ctrl)
+{
+    if (ctrl == NULL) {
+        return;
+    }
+
+    ctrl->old_pos = ctrl->dma_rx_size - __HAL_DMA_GET_COUNTER(ctrl->huart->hdmarx);
+    lwrb_reset(&ctrl->uart_rb);
+}
+
 int uart_dma_read(uart_dma_t* ctrl, uint8_t *data, uint32_t len, uint32_t timeout)
 {
     uint32_t tick = HAL_GetTick();
